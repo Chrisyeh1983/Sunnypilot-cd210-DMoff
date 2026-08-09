@@ -1,10 +1,16 @@
 name: sync-dm-off
 
-# 追 upstream sunnypilot/dev，套用「關閉 DM 分心警示」的 patch，產出 dm-off 分支。
-# Track upstream sunnypilot/dev, apply the DM-nag-disable patch, publish branch dm-off.
+# 追 upstream sunnypilot/dev，套用自訂 patch，產出 dm-off 分支。
+# Track upstream sunnypilot/dev, apply local patches, publish branch dm-off.
+#
+# 目前的 patch（見下方 PATCHES，那裡是唯一的真實來源）：
+#   1. DM-off        — 關閉駕駛監控的分心/瞌睡警示
+#   2. audio-restart — micd/soundd 崩潰後讓 manager 自動重啟它們
+#      （音效裝置偶爾開機時還沒 ready，get_stream 重試 30 秒後放棄 → 這兩支就死到熄火為止，
+#        害整趟都不能啟動橫向/縱向控制。加上 restart_if_crash=True 後會自己救回來。）
 #
 # 完全走 GitHub API，不 clone（上游 repo 5.2 GB）。因為本 repo 是 sunnypilot 的 fork，
-# 兩邊共用物件庫，所以「把樹指過來 + 換一個檔案」是零流量操作。
+# 兩邊共用物件庫，所以「把樹指過來 + 換幾個檔案」是零流量操作。
 # Pure GitHub API, no clone. Works because this repo is a fork sharing objects with upstream.
 
 on:
@@ -33,10 +39,9 @@ jobs:
       UPSTREAM_REPO: sunnypilot/sunnypilot
       UPSTREAM_BRANCH: dev
       OUTPUT_BRANCH: dm-off
-      TARGET_FILE: openpilot/selfdrive/monitoring/policy.py
       DRY_RUN: ${{ inputs.dry_run }}
     steps:
-      - name: Mirror upstream + apply DM-off patch
+      - name: Mirror upstream + apply patches
         shell: python {0}
         run: |
           import base64, json, os, re, sys, urllib.request, urllib.error
@@ -46,9 +51,12 @@ jobs:
           UPSTREAM   = os.environ["UPSTREAM_REPO"]
           UP_BRANCH  = os.environ["UPSTREAM_BRANCH"]
           OUT_BRANCH = os.environ["OUTPUT_BRANCH"]
-          TARGET     = os.environ["TARGET_FILE"]
           DRY_RUN    = os.environ.get("DRY_RUN", "false").lower() == "true"
           API        = "https://api.github.com"
+
+          # 改動 PATCHES 後一定要把這個字串也改掉，否則上游沒動時會被冪等檢查跳過、新 patch 永遠不會生效。
+          # Bump this whenever PATCHES changes, or the idempotency check will skip the rebuild.
+          PATCHSET   = "v2-dmoff+audiorestart"
 
           summary = []
           def note(msg):
@@ -86,25 +94,75 @@ jobs:
                   except Exception:
                       return e.code, {"raw": raw[:500].decode("utf-8", "replace")}
 
-          # --- patch 定義：唯一的真實來源 / the single source of truth for the patch ---
-          # 關掉 awareness 扣分的唯一入口 → 分心/瞌睡警示與 noResponseForceDecel 全部不觸發
-          PATTERN = re.compile(r"^([ \t]*)if certainly_distracted or maybe_distracted:[ \t]*$", re.M)
-          REPL    = r"\1if False and (certainly_distracted or maybe_distracted):  # DM-OFF patch"
-          MARKER  = "if False and (certainly_distracted or maybe_distracted):"
+          # ================= patch 定義：唯一的真實來源 / single source of truth =================
+          # 每個 edit 都要求「原始 pattern 恰好命中 1 次」，命中 0 次或多次 = 上游重構了，
+          # 直接中止不推送（dm-off 維持上一版，車機不受影響），寧可停更也不要套錯。
+          # Each edit must match EXACTLY once; otherwise abort without pushing.
+          PATCHES = [
+            {
+              "name": "DM-off — 關閉分心/瞌睡警示 / disable DM distraction+drowsiness nag",
+              "path": "openpilot/selfdrive/monitoring/policy.py",
+              "edits": [
+                {
+                  "find":   r"^([ \t]*)if certainly_distracted or maybe_distracted:[ \t]*$",
+                  "repl":   r"\1if False and (certainly_distracted or maybe_distracted):  # DM-OFF patch",
+                  "marker": "if False and (certainly_distracted or maybe_distracted):",
+                  "forbid": r"^[ \t]*if certainly_distracted or maybe_distracted:[ \t]*$",
+                },
+              ],
+            },
+            {
+              "name": "audio-restart — micd/soundd 崩潰自動重啟 / auto-restart micd+soundd",
+              "path": "openpilot/system/manager/process_config.py",
+              # 上游若拿掉 restart_if_crash 參數，硬套會讓 manager 一開機就 TypeError（比原本的 bug 嚴重得多），
+              # 所以先確認 PythonProcess 還收這個參數。
+              # Guard: if upstream drops the kwarg, patching would TypeError the manager at boot.
+              "requires": {
+                "path": "openpilot/system/manager/process.py",
+                "find": r"class PythonProcess\(ManagerProcess\):\s*\n\s*def __init__\([^)]*restart_if_crash",
+                "why":  "PythonProcess.__init__ 不再接受 restart_if_crash 參數",
+              },
+              "edits": [
+                {
+                  "find":   r'^([ \t]*)PythonProcess\("micd", "openpilot\.system\.micd", iscar\),[ \t]*$',
+                  "repl":   r'\1PythonProcess("micd", "openpilot.system.micd", iscar, restart_if_crash=True),  # AUDIO-RESTART patch',
+                  "marker": 'PythonProcess("micd", "openpilot.system.micd", iscar, restart_if_crash=True),',
+                  "forbid": r'^[ \t]*PythonProcess\("micd", "openpilot\.system\.micd", iscar\),[ \t]*$',
+                },
+                {
+                  "find":   r'^([ \t]*)PythonProcess\("soundd", "openpilot\.selfdrive\.ui\.soundd", driverview\),[ \t]*$',
+                  "repl":   r'\1PythonProcess("soundd", "openpilot.selfdrive.ui.soundd", driverview, restart_if_crash=True),  # AUDIO-RESTART patch',
+                  "marker": 'PythonProcess("soundd", "openpilot.selfdrive.ui.soundd", driverview, restart_if_crash=True),',
+                  "forbid": r'^[ \t]*PythonProcess\("soundd", "openpilot\.selfdrive\.ui\.soundd", driverview\),[ \t]*$',
+                },
+              ],
+            },
+          ]
+          # ======================================================================================
 
-          def apply_patch(src: str) -> str:
-              n = len(PATTERN.findall(src))
-              if n != 1:
-                  die(f"patch 目標在上游變了：預期 1 處符合，實際 {n} 處。"
-                      f"上游可能重構了 {TARGET}，需要人工重寫 patch。"
-                      f"（本次不推送，dm-off 維持在上一版，車機不受影響）")
-              out = PATTERN.sub(REPL, src, count=1)
-              if MARKER not in out:
-                  die("套用後找不到 marker，patch 邏輯有問題")
+          def get_upstream_file(path, ref):
+              st, blob = api("GET", f"/repos/{UPSTREAM}/contents/{path}?ref={ref}")
+              if st != 200:
+                  die(f"讀不到上游 {path}: HTTP {st} {blob}")
+              return base64.b64decode(blob["content"]).decode("utf-8")
+
+          def apply_patch(p, src):
+              out = src
+              for e in p["edits"]:
+                  n = len(re.findall(e["find"], out, re.M))
+                  if n != 1:
+                      die(f"[{p['name']}] patch 目標在上游變了：預期 1 處符合，實際 {n} 處"
+                          f"（{p['path']}）。需要人工重寫 patch。"
+                          f"（本次不推送，{OUT_BRANCH} 維持在上一版，車機不受影響）")
+                  out = re.sub(e["find"], e["repl"], out, count=1, flags=re.M)
+                  if e["marker"] not in out:
+                      die(f"[{p['name']}] 套用後找不到 marker，patch 邏輯有問題")
+                  if re.search(e["forbid"], out, re.M):
+                      die(f"[{p['name']}] 套用後原始程式碼還在，patch 沒真的生效")
               try:
-                  compile(out, TARGET, "exec")
-              except SyntaxError as e:
-                  die(f"套用後語法檢查失敗：{e}")
+                  compile(out, p["path"], "exec")
+              except SyntaxError as ex:
+                  die(f"[{p['name']}] 套用後語法檢查失敗：{ex}")
               return out
 
           # --- 1. 上游最新 commit ---
@@ -115,15 +173,18 @@ jobs:
           note(f"上游 {UPSTREAM}@{UP_BRANCH} = `{up_sha[:8]}`")
 
           TRAILER = f"upstream-commit: {up_sha}"
+          PS_LINE = f"patchset: {PATCHSET}"
 
-          # --- 2. 已經處理過就跳過（冪等）---
+          # --- 2. 同一版上游 + 同一組 patch 就跳過（冪等）---
           st, cur = api("GET", f"/repos/{OURS}/commits/{OUT_BRANCH}")
-          if st == 200 and TRAILER in (cur.get("commit", {}).get("message") or ""):
-              note(f"`{OUT_BRANCH}` 已經是這版上游的 patch 版本，無事可做。")
+          cur_msg = (cur.get("commit", {}).get("message") or "") if st == 200 else ""
+          if st == 200 and TRAILER in cur_msg and PS_LINE in cur_msg:
+              note(f"`{OUT_BRANCH}` 已經是這版上游 + `{PATCHSET}`，無事可做。")
               _flush_summary()
               sys.exit(0)
           if st == 200:
-              note(f"目前 `{OUT_BRANCH}` = `{cur['sha'][:8]}`，需要更新")
+              why = "上游有新 commit" if TRAILER not in cur_msg else f"patch 組合換成 {PATCHSET}"
+              note(f"目前 `{OUT_BRANCH}` = `{cur['sha'][:8]}`，需要更新（{why}）")
           else:
               note(f"`{OUT_BRANCH}` 尚不存在，將建立")
 
@@ -133,15 +194,23 @@ jobs:
               die(f"讀不到上游 commit 物件: HTTP {st} {upc}")
           base_tree = upc["tree"]["sha"]
 
-          # --- 4. 取原始檔並套 patch ---
-          st, blob = api("GET", f"/repos/{UPSTREAM}/contents/{TARGET}?ref={up_sha}")
-          if st != 200:
-              die(f"讀不到 {TARGET}: HTTP {st} {blob}")
-          src = base64.b64decode(blob["content"]).decode("utf-8")
-          patched = apply_patch(src)
-          line_no = patched.split("\n").index(
-              next(l for l in patched.split("\n") if MARKER in l)) + 1
-          note(f"patch 套用成功，位置第 {line_no} 行；語法檢查通過")
+          # --- 4. 逐個 patch：前置檢查 → 取原始檔 → 套用 → 語法檢查 ---
+          patched_files = {}
+          for p in PATCHES:
+              req = p.get("requires")
+              if req:
+                  guard_src = get_upstream_file(req["path"], up_sha)
+                  if not re.search(req["find"], guard_src, re.M):
+                      die(f"[{p['name']}] 前置檢查失敗：{req['why']}（{req['path']}）。"
+                          f"硬套會讓車機開機失敗，因此中止不推送。")
+                  note(f"[{p['name']}] 前置檢查通過（{req['path']}）")
+              src = get_upstream_file(p["path"], up_sha)
+              out = apply_patch(p, src)
+              patched_files[p["path"]] = out
+              lines = out.split("\n")
+              hits = [str(i + 1) for i, l in enumerate(lines)
+                      for e in p["edits"] if e["marker"] in l]
+              note(f"[{p['name']}] ✅ {p['path']} 第 {', '.join(hits)} 行；語法檢查通過")
 
           if DRY_RUN:
               note("DRY RUN：到此為止，不推送。")
@@ -149,22 +218,27 @@ jobs:
               sys.exit(0)
 
           # --- 5. 寫 blob / tree / commit 到我們的 repo（同 fork network，零流量）---
-          st, nb = api("POST", f"/repos/{OURS}/git/blobs", {
-              "content": base64.b64encode(patched.encode()).decode(), "encoding": "base64"})
-          if st not in (200, 201):
-              die(f"建立 blob 失敗: HTTP {st} {nb}")
+          tree_entries = []
+          for path, content in patched_files.items():
+              st, nb = api("POST", f"/repos/{OURS}/git/blobs", {
+                  "content": base64.b64encode(content.encode()).decode(), "encoding": "base64"})
+              if st not in (200, 201):
+                  die(f"建立 blob 失敗（{path}）: HTTP {st} {nb}")
+              tree_entries.append({"path": path, "mode": "100644", "type": "blob", "sha": nb["sha"]})
 
-          st, nt = api("POST", f"/repos/{OURS}/git/trees", {
-              "base_tree": base_tree,
-              "tree": [{"path": TARGET, "mode": "100644", "type": "blob", "sha": nb["sha"]}]})
+          st, nt = api("POST", f"/repos/{OURS}/git/trees",
+                       {"base_tree": base_tree, "tree": tree_entries})
           if st not in (200, 201):
               die(f"建立 tree 失敗: HTTP {st} {nt}。"
                   f"若訊息是找不到 base_tree，代表本 repo 不是 {UPSTREAM} 的 fork（物件庫沒共用），"
                   f"必須改用 clone 版流程。")
 
-          msg = (f"DM-off patch on {UP_BRANCH}\n\n"
-                 f"Auto-generated. Upstream tree untouched except {TARGET}.\n"
-                 f"{TRAILER}\n")
+          names = "\n".join(f"  - {p['name']}" for p in PATCHES)
+          msg = (f"Local patches on {UP_BRANCH}\n\n"
+                 f"Auto-generated. Upstream tree untouched except:\n"
+                 + "\n".join(f"  {path}" for path in patched_files) + "\n\n"
+                 f"Patches:\n{names}\n\n"
+                 f"{TRAILER}\n{PS_LINE}\n")
           st, nc = api("POST", f"/repos/{OURS}/git/commits",
                        {"message": msg, "tree": nt["sha"], "parents": [up_sha]})
           if st not in (200, 201):
@@ -180,15 +254,19 @@ jobs:
           if st not in (200, 201):
               die(f"更新分支失敗: HTTP {st} {r}")
 
-          # --- 7. 回頭跟伺服器驗收（不信任本地變數）---
-          st, chk = api("GET", f"/repos/{OURS}/contents/{TARGET}?ref={OUT_BRANCH}")
-          if st != 200:
-              die(f"驗收讀取失敗: HTTP {st} {chk}")
-          final = base64.b64decode(chk["content"]).decode("utf-8")
-          if MARKER not in final:
-              die("驗收失敗：推上去的檔案裡沒有 patch！")
-          if re.search(r"^[ \t]*if certainly_distracted or maybe_distracted:", final, re.M):
-              die("驗收失敗：原始的分心判斷還在！")
+          # --- 7. 回頭跟伺服器驗收每一個 patch（不信任本地變數）---
+          for p in PATCHES:
+              st, chk = api("GET", f"/repos/{OURS}/contents/{p['path']}?ref={OUT_BRANCH}")
+              if st != 200:
+                  die(f"驗收讀取失敗（{p['path']}）: HTTP {st} {chk}")
+              final = base64.b64decode(chk["content"]).decode("utf-8")
+              for e in p["edits"]:
+                  if e["marker"] not in final:
+                      die(f"驗收失敗：{p['path']} 推上去後沒有 patch！")
+                  if re.search(e["forbid"], final, re.M):
+                      die(f"驗收失敗：{p['path']} 裡原始程式碼還在！")
+              note(f"[{p['name']}] 伺服器端驗收通過")
 
-          note(f"✅ `{OUT_BRANCH}` 已更新為 `{new_sha[:8]}`（上游 `{up_sha[:8]}` + DM-off patch），伺服器端驗收通過")
+          note(f"✅ `{OUT_BRANCH}` 已更新為 `{new_sha[:8]}`"
+               f"（上游 `{up_sha[:8]}` + {len(PATCHES)} 組 patch / {PATCHSET}）")
           _flush_summary()
