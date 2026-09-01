@@ -26,7 +26,10 @@ MAX_FPS = float(os.getenv("OPS_FPS", 30))    # 要 > 相機的 20fps，否則會
 
 ICON_DIR = "/data/openpilot/openpilot/selfdrive/assets/icons_mici/onroad"
 ICONS = {"ts.png": ICON_DIR + "/turn_signal_left.png",     # 方向燈箭頭 / blinker arrow
-         "bs.png": ICON_DIR + "/blind_spot_left.png"}      # 盲點 / blind spot
+         "bs.png": ICON_DIR + "/blind_spot_left.png",      # 盲點 / blind spot
+         "wheel.png": ICON_DIR + "/../wheel.png",          # 方向盤 / steering wheel
+         "wheelc.png": ICON_DIR + "/../wheel_critical.png",
+         "excl.png": ICON_DIR + "/../exclamation_point.png"}
 
 _latest = {"jpeg": None, "ts": 0.0, "fps": 0.0}
 _lock = threading.Condition()
@@ -140,8 +143,9 @@ function poly(pts,b){
 }
 
 // 車機圖示 / icons served from the car's own asset folder
-const IM={ts:new Image(), bs:new Image()};
+const IM={ts:new Image(), bs:new Image(), wheel:new Image(), wheelc:new Image(), excl:new Image()};
 IM.ts.src='/icon/ts.png'; IM.bs.src='/icon/bs.png';
+IM.wheel.src='/icon/wheel.png'; IM.wheelc.src='/icon/wheelc.png'; IM.excl.src='/icon/excl.png';
 let lastSide='left', aA=0, prevAlert=null;
 
 function drawIcon(im,x,y,w,h,alpha,flip){
@@ -182,6 +186,65 @@ function signals(b){
     const h=0.14*IH, w=h*120/109, mx=0.02*IW, y=b.oy+0.14*IH, a=blinkA();
     if(M.blinkL) drawIcon(IM.ts, b.ox+mx,        y, w, h, a, false);
     if(M.blinkR) drawIcon(IM.ts, b.ox+IW-mx-w,   y, w, h, a, true);
+  }
+}
+
+function interp(x,xs,ys){
+  if(x<=xs[0]) return ys[0];
+  if(x>=xs[1]) return ys[1];
+  return ys[0]+(ys[1]-ys[0])*(x-xs[0])/(xs[1]-xs[0]);
+}
+function mix(a,b,f){ f=Math.max(0,Math.min(1,f));
+  return [a[0]+(b[0]-a[0])*f, a[1]+(b[1]-a[1])*f, a[2]+(b[2]-a[2])*f]; }
+function rgba(c,a){ return 'rgba('+Math.round(c[0])+','+Math.round(c[1])+','+Math.round(c[2])+','+a.toFixed(3)+')'; }
+
+// 扭力弧線 + 會轉的方向盤，照抄 mici/onroad/torque_bar.py 與 hud_renderer._draw_steering_wheel
+function steering(b){
+  const IW=M.w*b.k2, IH=M.h*b.k2, S=IH/240;
+  const t=Math.max(-1,Math.min(1,M.torque||0)), ta=M.torqueA||0, at=Math.abs(t);
+  const on=(M.status==='engaged'||M.status==='lat_only');
+
+  if(ta>0.01){
+    // 弧線半徑很大(1200)，所以看起來幾乎是條微彎的橫條 / huge radius = a gently curved bar
+    const h=interp(at,[0.5,1],[14,56])*S, off=interp(at,[0.5,1],[22,26])*S;
+    const R=1200*S, midR=R+h/2, span=ta*12.7*Math.PI/180;
+    const cx=b.ox+IW/2+8*S, cy=b.oy+IH+R-off, TOP=-Math.PI/2;
+    g.save(); g.beginPath(); g.rect(b.ox,b.oy,IW,IH); g.clip();
+    g.lineCap='round'; g.lineWidth=h;
+    // 底槽 / background groove
+    g.strokeStyle='rgba(255,255,255,'+((on?interp(at,[0.5,1],[0.25,0.5]):0.15)*ta).toFixed(3)+')';
+    g.beginPath(); g.arc(cx,cy,midR,TOP-span/2,TOP+span/2); g.stroke();
+    // 實際出力，往兩側長；接近極限會轉黃再轉橘 / fades to yellow then orange near the limit
+    if(at>0.002){
+      const a1=TOP+span/2*t;
+      const ex=cx+0.65*(t<0?-1:1)*(midR+h/2)*Math.sin(span/2);
+      const f=Math.max(0,at-0.75)*4;
+      let c0,c1,al;
+      if(on){ c0=mix([255,255,255],[255,200,0],f); c1=mix([255,255,255],[255,115,0],f); al=0.9*ta; }
+      else  { c0=c1=[255,255,255]; al=0.35*ta; }
+      const gr=g.createLinearGradient(cx,0,ex,0);
+      gr.addColorStop(0,rgba(c0,al)); gr.addColorStop(1,rgba(c1,al));
+      g.strokeStyle=gr; g.beginPath(); g.arc(cx,cy,midR,Math.min(TOP,a1),Math.max(TOP,a1)); g.stroke();
+    }
+    // 置中小點（出力小的時候才有）/ centre dot, only at low torque
+    if(at<0.5){
+      g.beginPath(); g.arc(cx,b.oy+IH-off-h/2,5*S,0,7);
+      g.fillStyle='rgba(182,182,182,'+(0.9*ta).toFixed(3)+')'; g.fill();
+    }
+    g.restore();
+  }
+
+  // 方向盤圖示：左下角，跟著實際方向盤角度轉 / bottom-left, rotates with the real wheel
+  const wa=M.wheelA||0;
+  if(wa>0.01){
+    const w=50*S, im=M.wheelCritical?IM.wheelc:IM.wheel;
+    const px=b.ox+21*S+w/2, py=b.oy+IH-14*S-w/2+(M.wheelY||0)*S;
+    if(im.complete&&im.naturalWidth){
+      g.save(); g.globalAlpha=Math.min(1,wa);
+      g.translate(px,py); g.rotate(-(M.steerAngle||0)*Math.PI/180);
+      g.drawImage(im,-w/2,-w/2,w,w); g.restore();
+    }
+    if(M.wheelCritical) drawIcon(IM.excl, px+w/2+10*S-4.5*S, py-22*S, 9*S, 44*S, wa, false);
   }
 }
 
@@ -302,6 +365,7 @@ function draw(){
     hud(b);
     alertHud(b);
     signals(b);
+    steering(b);
     st.textContent=(M.engaged?'ENGAGED':'ready')+(M.calibrated?'':' (未校正)')
                    +'  '+cv.width+'x'+cv.height+'  lines:'+(M.lines?M.lines.length:0)
                    +(M.leads&&M.leads.length?'  lead '+M.leads[0].d+'m':'');

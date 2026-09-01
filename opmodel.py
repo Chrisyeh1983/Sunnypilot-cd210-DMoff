@@ -115,11 +115,48 @@ def _alert(ss):
         icon, side = "ts", None          # 沿用上一次的方向 / keep last side
     elif ev == "laneChangeBlocked":
         icon, side = "bs", None
+    # steerRequired 會把方向盤圖示換成紅色警告版 / swaps the wheel icon to the critical one
+    try:
+        steer_req = str(ss.alertHudVisual) == "steerRequired"
+    except Exception:
+        steer_req = False
     c = ALERT_COLORS.get(status, ALERT_COLORS[0])
-    return {"t1": str(ss.alertText1 or "").lower(), "t2": str(ss.alertText2 or "").lower(),
+    return {"steerRequired": steer_req,
+            "t1": str(ss.alertText1 or "").lower(), "t2": str(ss.alertText2 or "").lower(),
             "size": size, "status": status, "ev": ev, "bgh": round(bgh, 4),
             "icon": icon, "side": side,
             "bg": "%d,%d,%d" % c}
+
+
+ACCEL_G = 9.81
+DEFAULT_MAX_LAT_ACCEL = 3.0
+
+
+def _torque(sm, max_lat_accel):
+    """照抄 torque_bar.py TorqueBar._update_state：估 AI 用掉多少橫向扭力（-1~1）。"""
+    cs = sm['controlsState']
+    which = None
+    try:
+        which = cs.lateralControlState.which()
+    except Exception:
+        pass
+    if which in ('angleState', 'curvatureState'):
+        car_state = sm['carState']
+        v = float(car_state.vEgo)
+        actual = float(cs.curvature) * v * v
+        desired = float(cs.desiredCurvature) * v * v
+        accel_diff = desired - actual
+        try:
+            roll = float(sm['vehicleParameters'].roll)
+        except Exception:
+            roll = 0.0
+        # 低速時 roll 估不準，按車速漸進帶入 / roll is noisy near standstill
+        roll_comp = roll * ACCEL_G * float(np.interp(v, [5, 15], [0.0, 1.0]))
+        lat = actual - roll_comp
+        if not bool(sm['carControl'].latActive):
+            return 0.0
+        return float(np.clip((lat + accel_diff) / max(max_lat_accel, 1e-3), -1.0, 1.0))
+    return float(-sm['carOutput'].actuatorsOutput.torque)
 
 
 def _ball_colors(status, conf):
@@ -164,7 +201,8 @@ def _rgba(rgb, alpha):
 
 def worker(get_size, hz=15.0):
     services = ['modelV2', 'extrinsicsCalibration', 'deviceState', 'wideRoadCameraState',
-                'selfdriveState', 'radarState', 'carState', 'onroadEvents']
+                'selfdriveState', 'radarState', 'carState', 'onroadEvents',
+                'controlsState', 'carControl', 'carOutput', 'vehicleParameters']
     try:
         sm = messaging.SubMaster(services + ['selfdriveStateSP'])
     except Exception:
@@ -187,6 +225,19 @@ def worker(get_size, hz=15.0):
     # 盲點圖示淡入淡出 FirstOrderFilter(0, rc=0.15) / blind spot fade
     bs_l, bs_r, bs_k = 0.0, 0.0, period / (0.15 + period)
     show_ts, show_bs = True, True
+    # 扭力弧線 / 方向盤圖示的濾波器（rc 照抄車機）/ same rc values as the car
+    tq_x, tq_k = 0.0, period / (0.1 + period)
+    tqa_x = 0.0
+    wa_x, wa_k = 0.0, period / (0.05 + period)
+    wy_x = 0.0
+    try:
+        from opendbc.car.structs import car as _car
+        with _car.CarParams.from_bytes(params.get("CarParamsPersistent")) as _cp:
+            max_lat_accel = float(_cp.maxLateralAccel)
+    except Exception:
+        max_lat_accel = DEFAULT_MAX_LAT_ACCEL
+    if not max_lat_accel or max_lat_accel <= 0:
+        max_lat_accel = DEFAULT_MAX_LAT_ACCEL
     while True:
         t0 = time.time()
         sm.update(200)
@@ -254,6 +305,26 @@ def worker(get_size, hz=15.0):
         bs_l += bs_k * ((1.0 if cs.leftBlindspot else 0.0) - bs_l)
         bs_r += bs_k * ((1.0 if cs.rightBlindspot else 0.0) - bs_r)
 
+        # 扭力弧線 + 方向盤圖示 ---------------------------------------------
+        try:
+            tq_x += tq_k * (_torque(sm, max_lat_accel) - tq_x)
+        except Exception:
+            tq_x += tq_k * (0.0 - tq_x)
+        # 弧線只在「有橫向控制」時亮 / bar shows only when lateral control is on
+        tqa_x += tq_k * ((0.0 if status in ("disengaged", "long_only") else 1.0) - tqa_x)
+
+        alert = _alert(sm['selfdriveState'])
+        wheel_critical = bool(alert and alert.get("steerRequired"))
+        bs_detected = show_bs and (bs_l > 0.01 or bs_r > 0.01)
+        if wheel_critical:
+            wa_t, wy_t = 1.0, 0.0
+        elif status == "disengaged" or bs_detected:
+            wa_t, wy_t = 0.0, 25.0      # 淡出並往下滑（圖示高 50 的一半）/ fade out and slide down
+        else:
+            wa_t, wy_t = 0.9, 0.0
+        wa_x += wa_k * (wa_t - wa_x)
+        wy_x += tq_k * (wy_t - wy_x)
+
         out = {"ready": bool(sm.updated['modelV2'] or sm.recv_frame['modelV2'] > 0),
                "w": w, "h": h, "t": time.time(),
                "engaged": engaged, "rainbow": rainbow, "status": status,
@@ -262,7 +333,11 @@ def worker(get_size, hz=15.0):
                "blinkL": bool(cs.leftBlinker), "blinkR": bool(cs.rightBlinker),
                "bsL": round(bs_l, 3), "bsR": round(bs_r, 3),
                "showTS": show_ts, "showBS": show_bs,
-               "alert": _alert(sm['selfdriveState']),
+               "torque": round(tq_x, 3), "torqueA": round(tqa_x, 3),
+               "steerAngle": round(float(cs.steeringAngleDeg), 1),
+               "wheelA": round(wa_x, 3), "wheelY": round(wy_x, 2),
+               "wheelCritical": wheel_critical,
+               "alert": alert,
                "calibrated": len(getattr(calib, 'rpyCalib', [])) == 3,
                "lines": [], "path": [], "leads": []}
         try:
