@@ -189,6 +189,48 @@ function signals(b){
   }
 }
 
+// 手刻圓角矩形路徑（不用 roundRect，安卓盒子的瀏覽器不一定支援）
+function roundRectPath(x,y,w,h,r){
+  r=Math.min(r,w/2,h/2);
+  g.beginPath();
+  g.moveTo(x+r,y); g.lineTo(x+w-r,y); g.arcTo(x+w,y,x+w,y+r,r);
+  g.lineTo(x+w,y+h-r); g.arcTo(x+w,y+h,x+w-r,y+h,r);
+  g.lineTo(x+r,y+h); g.arcTo(x,y+h,x,y+h-r,r);
+  g.lineTo(x,y+r); g.arcTo(x,y,x+r,y,r);
+  g.closePath();
+}
+
+// 狀態邊框 + 加速/煞車力條。
+// 兩個都是車機「大螢幕版」才有的（mici 沒有），顏色與算式照抄
+// onroad/augmented_road_view._draw_border 與 sunnypilot/onroad/rocket_fuel.py
+function extras(b){
+  const IW=M.w*b.k2, IH=M.h*b.k2;
+
+  // 邊框：UI_BORDER_SIZE=30、roundness 0.12（基準螢幕高 1080）
+  const B=Math.max(2, IH*30/1080);
+  g.save();
+  g.lineWidth=B;
+  g.strokeStyle='rgba('+(M.border||'18,40,57')+',1)';
+  roundRectPath(b.ox+B/2, b.oy+B/2, IW-B, IH-B, 0.12*Math.min(IW,IH)/2);
+  g.stroke();
+  g.restore();
+
+  // 力條：左緣，加速往上長(綠)、減速往下長(紅)，最長 85% 的一半
+  if(M.showRF!==false){
+    const a=M.accel||0;
+    let hha=0;
+    if(a>0) hha=0.85-0.1/a; else if(a<0) hha=0.85+0.1/a;
+    if(hha>0){
+      hha*=IH;
+      const wp=28*(IH/240), cy=b.oy+IH/2;
+      g.save(); g.beginPath(); g.rect(b.ox,b.oy,IW,IH); g.clip();
+      g.fillStyle = a>0 ? 'rgba(0,245,0,0.784)' : 'rgba(245,0,0,0.784)';
+      g.fillRect(b.ox+B, a>0 ? cy-hha/2 : cy, wp, hha/2);
+      g.restore();
+    }
+  }
+}
+
 function interp(x,xs,ys){
   if(x<=xs[0]) return ys[0];
   if(x>=xs[1]) return ys[1];
@@ -321,7 +363,7 @@ function hud(b){
   // 信心球：半徑 24/1080，貼右緣，越高＝AI 越有把握；未接手時沉出畫面
   g.shadowBlur=0;
   const r=IH*0.0222, conf=(M.conf==null?-0.5:M.conf);
-  const y=b.oy+(1-conf)*(IH-2*r)+r, x=b.ox+IW-r;
+  const y=b.oy+(1-conf)*(IH-2*r)+r, x=b.ox+IW-r-IH*30/1080;
   const gr=g.createLinearGradient(0,y-r,0,y+r);
   gr.addColorStop(0,M.ballTop||'rgb(50,50,50)');
   gr.addColorStop(1,M.ballBot||'rgb(13,13,13)');
@@ -366,6 +408,7 @@ function draw(){
     alertHud(b);
     signals(b);
     steering(b);
+    extras(b);
     st.textContent=(M.engaged?'ENGAGED':'ready')+(M.calibrated?'':' (未校正)')
                    +'  '+cv.width+'x'+cv.height+'  lines:'+(M.lines?M.lines.length:0)
                    +(M.leads&&M.leads.length?'  lead '+M.leads[0].d+'m':'');

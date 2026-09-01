@@ -30,11 +30,11 @@ cd /data && setsid nohup env PYTHONPATH=/data/openpilot OPS_CAM=narrow \
 ## 畫了什麼 / What it draws
 
 車道線、路緣、行駛路徑（含彩虹模式）、前車、車速、AI 信心球、方向燈、盲點、系統警示、
-會轉的方向盤圖示、底部橫向扭力弧線。
+會轉的方向盤圖示、底部橫向扭力弧線、狀態邊框、加速/煞車力條。
 **所有顏色/寬度/位置都照抄車機自己的 renderer**，不是自己發明的：
 `selfdrive/ui/mici/onroad/{model_renderer,confidence_ball,alert_renderer,hud_renderer}.py`
-與 `selfdrive/ui/mici/onroad/torque_bar.py`、
-`selfdrive/ui/sunnypilot/onroad/{rainbow_path,blind_spot_indicators,turn_signal}.py`。
+與 `selfdrive/ui/mici/onroad/torque_bar.py`、`selfdrive/ui/onroad/augmented_road_view.py`、
+`selfdrive/ui/sunnypilot/onroad/{rainbow_path,blind_spot_indicators,turn_signal,rocket_fuel}.py`。
 
 ## 幾個關鍵細節 / Gotchas
 

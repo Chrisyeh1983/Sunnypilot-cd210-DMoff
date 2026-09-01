@@ -131,6 +131,13 @@ def _alert(ss):
 ACCEL_G = 9.81
 DEFAULT_MAX_LAT_ACCEL = 3.0
 
+# 狀態邊框顏色，照抄 onroad/augmented_road_view.py 的 BORDER_COLORS
+BORDER_COLORS = {"disengaged": "18,40,57",     # 深藍 / blue
+                 "override": "137,146,141",    # 灰 / gray
+                 "engaged": "22,127,64",       # 綠 / green
+                 "lat_only": "0,200,200",      # 青 / cyan
+                 "long_only": "150,28,168"}    # 紫 / purple
+
 
 def _torque(sm, max_lat_accel):
     """照抄 torque_bar.py TorqueBar._update_state：估 AI 用掉多少橫向扭力（-1~1）。"""
@@ -230,6 +237,9 @@ def worker(get_size, hz=15.0):
     tqa_x = 0.0
     wa_x, wa_k = 0.0, period / (0.05 + period)
     wy_x = 0.0
+    # 加速/煞車力條：車機是每格 (v-x)/5 @20fps ≒ rc 0.2s / rocket_fuel smoothing
+    rf_x, rf_k = 0.0, period / (0.2 + period)
+    show_rf = True
     try:
         from opendbc.car.structs import car as _car
         with _car.CarParams.from_bytes(params.get("CarParamsPersistent")) as _cp:
@@ -278,8 +288,9 @@ def worker(get_size, hz=15.0):
             try:
                 show_ts = bool(params.get_bool("ShowTurnSignals"))
                 show_bs = bool(params.get_bool("BlindSpot"))
+                show_rf = bool(params.get_bool("RocketFuel"))
             except Exception:
-                show_ts, show_bs = True, True
+                show_ts, show_bs, show_rf = True, True, True
 
         m = sm['modelV2']
         engaged = bool(sm['selfdriveState'].enabled)
@@ -325,6 +336,9 @@ def worker(get_size, hz=15.0):
         wa_x += wa_k * (wa_t - wa_x)
         wy_x += tq_k * (wy_t - wy_x)
 
+        # 加速/煞車力條（原始碼只平滑 aEgo，長度換算交給網頁）/ smoothed aEgo only
+        rf_x += rf_k * (float(cs.aEgo) - rf_x)
+
         out = {"ready": bool(sm.updated['modelV2'] or sm.recv_frame['modelV2'] > 0),
                "w": w, "h": h, "t": time.time(),
                "engaged": engaged, "rainbow": rainbow, "status": status,
@@ -332,7 +346,9 @@ def worker(get_size, hz=15.0):
                "conf": round(float(conf_x), 3), "ballTop": ball_top, "ballBot": ball_bot,
                "blinkL": bool(cs.leftBlinker), "blinkR": bool(cs.rightBlinker),
                "bsL": round(bs_l, 3), "bsR": round(bs_r, 3),
-               "showTS": show_ts, "showBS": show_bs,
+               "showTS": show_ts, "showBS": show_bs, "showRF": show_rf,
+               "accel": round(rf_x, 3),
+               "border": BORDER_COLORS.get(status, BORDER_COLORS["disengaged"]),
                "torque": round(tq_x, 3), "torqueA": round(tqa_x, 3),
                "steerAngle": round(float(cs.steeringAngleDeg), 1),
                "wheelA": round(wa_x, 3), "wheelY": round(wy_x, 2),
