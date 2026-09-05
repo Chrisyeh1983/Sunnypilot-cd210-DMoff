@@ -235,6 +235,12 @@ def ensure_running(procs: ValuesView[ManagerProcess], started: bool, params: Par
       p.stop(block=False)
 
   for p in running:
+    # AUDIO-RESTART patch: 崩潰的 process 要先收屍，start() 才會真的重開
+    # (upstream dropped restart_if_crash; start() early-returns while proc is set)
+    if p.name in ('micd', 'soundd') and p.proc is not None \
+       and p.proc.exitcode is not None and not p.shutting_down:
+      cloudlog.warning(f'AUDIO-RESTART: {p.name} died ({p.proc.exitcode}), restarting')
+      p.stop(block=True)
     p.start()
 
   return running

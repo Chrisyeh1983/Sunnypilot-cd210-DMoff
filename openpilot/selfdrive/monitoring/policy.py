@@ -358,7 +358,7 @@ class DriverMonitoring:
     certainly_distracted = self.driver_distraction_filter.x > 0.63 and self.driver_distracted and self.face_detected
     maybe_distracted = self.is_model_uncertain or not self.face_detected
 
-    if certainly_distracted or maybe_distracted:
+    if False and (certainly_distracted or maybe_distracted):  # DM-OFF patch
       # should always be counting if distracted unless at low speed and reaching green
       # also will not be reaching 0 if DM is active when not engaged
       if not (lowspeed_exemption or always_on_exemption):
