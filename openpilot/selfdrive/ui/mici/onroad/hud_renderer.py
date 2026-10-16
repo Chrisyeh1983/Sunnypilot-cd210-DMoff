@@ -184,6 +184,7 @@ class HudRenderer(Widget):
 
     if self.is_cruise_set:
       self._draw_set_speed(rect)
+    self._draw_current_speed_top(rect)  # SPEED patch: small top speed on mici
 
     self._draw_model_source(rect)
 
@@ -303,6 +304,19 @@ class HudRenderer(Widget):
       0,
       max_color,
     )
+
+  def _draw_current_speed_top(self, rect: rl.Rectangle) -> None:
+    # SPEED patch: small top-centred speed (stock one is sized for the 2160x1080 big UI)
+    size, unit_size, top = 50, 20, 4
+    speed_text = str(round(self.speed))
+    speed_sz = measure_text_cached(self._font_bold, speed_text, size)
+    rl.draw_text_ex(self._font_bold, speed_text,
+                    rl.Vector2(rect.x + rect.width / 2 - speed_sz.x / 2, rect.y + top), size, 0, COLORS.WHITE)
+    unit_text = tr('km/h') if ui_state.is_metric else tr('mph')
+    unit_sz = measure_text_cached(self._font_medium, unit_text, unit_size)
+    rl.draw_text_ex(self._font_medium, unit_text,
+                    rl.Vector2(rect.x + rect.width / 2 - unit_sz.x / 2, rect.y + top + speed_sz.y - 8),
+                    unit_size, 0, COLORS.WHITE_TRANSLUCENT)
 
   def _draw_current_speed(self, rect: rl.Rectangle) -> None:
     """Draw the current vehicle speed and unit."""
