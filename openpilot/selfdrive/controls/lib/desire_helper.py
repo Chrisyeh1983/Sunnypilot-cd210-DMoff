@@ -82,14 +82,14 @@ class DesireHelper:
 
         if lane_change_prob < 0.02 and self.lane_change_timer >= LANE_CHANGE_START_TIME:
           self.lane_change_timer = 0.0
-          if one_blinker:
+          if False:  # ONE-LC patch: one blinker tap = one lane change, never chain back into preLaneChange
             self.lane_change_state = LaneChangeState.preLaneChange
             self.lane_change_direction = self.get_lane_change_direction(carstate)
           else:
             self.lane_change_state = LaneChangeState.off
             self.lane_change_direction = LaneChangeDirection.none
 
-    self.prev_one_blinker = one_blinker and lateral_active
+    self.prev_one_blinker = one_blinker  # ONE-LC patch: no fake rising edge when lateral blips
 
     if self.lane_turn_direction != TurnDirection.none:
       self.desire = TURN_DESIRES[self.lane_turn_direction]
